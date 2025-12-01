@@ -6,48 +6,50 @@ library(purrr)
 
 parse_csv_card <- function(path) {
   
-  raw <- readr::read_lines(path)
+  raw <- read_lines(path)
+  raw <- raw[nchar(raw) > 0]   # remove empty lines
   
-  # remove empty lines
-  raw <- raw[nchar(raw) > 0]
+  # --- Identify section headers ---
+  info_start  <- grep("CARD INFORMATION", raw)
+  cond_start  <- grep("CURRENT PRICES BY CONDITION", raw)
+  hist_start  <- grep("PRICE HISTORY", raw)
   
-  # extract metadata (Card Name, Set Name, Rarity, etc.)
-  metadata_lines <- raw[grepl(",", raw) & !grepl("Variant,Condition", raw)]
-  
-  metadata <- metadata_lines %>%
-    str_split_fixed(",", 2) %>%
+  # --- Extract metadata block ---
+  meta_block <- raw[(info_start + 1):(cond_start - 1)]
+  meta_df <- meta_block %>%
+    str_split_fixed("\t", 2) %>%
     as.data.frame() %>%
     setNames(c("field", "value")) %>%
     mutate(
       field = str_trim(field),
       value = str_trim(value)
-    )
+    ) %>%
+    pivot_wider(names_from = field, values_from = value)
   
-  # pivot metadata into one row
-  meta_wide <- tidyr::pivot_wider(metadata,
-                                  names_from = field,
-                                  values_from = value)
+  # --- Extract condition price table ---
+  cond_block <- raw[(cond_start + 1):(hist_start - 1)]
+  cond_table <- read_csv(
+    paste(cond_block, collapse = "\n"),
+    show_col_types = FALSE
+  )
   
-  # extract price table
-  start <- grep("Variant,Condition", raw)
-  if (length(start) == 0) {
-    price_tbl <- tibble()
-  } else {
-    price_rows <- raw[(start):(length(raw))]
-    price_tbl <- read_csv(
-      paste(price_rows, collapse = "\n"),
-      show_col_types = FALSE
-    )
-  }
+  # --- Extract historical prices table ---
+  hist_block <- raw[(hist_start + 1):length(raw)]
+  hist_table <- read_csv(
+    paste(hist_block, collapse = "\n"),
+    show_col_types = FALSE
+  )
   
-  # combine into one tibble (nested price table)
+  # --- Return tidy nested tibble ---
   tibble(
     file = basename(path),
-    card_name = meta_wide$`Card Name`,
-    set_name = meta_wide$`Set Name`,
-    rarity = meta_wide$Rarity,
-    market_price = meta_wide$`Current Market Price`,
-    metadata = list(meta_wide),
-    conditions = list(price_tbl)
+    card_name = meta_df$`Card Name`,
+    set_name = meta_df$`Set Name`,
+    rarity = meta_df$Rarity,
+    card_number = meta_df$`Card Number`,
+    market_price = meta_df$`Current Market Price`,
+    metadata = list(meta_df),
+    conditions = list(cond_table),
+    history = list(hist_table)
   )
 }
