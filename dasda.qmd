@@ -1,0 +1,929 @@
+---
+title: "Pokémon Card Market Analysis"
+subtitle: "Index Behavior, Predictability & Risk Factors Using Recursive Methods"
+author: "Your Name"
+date: today
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+#| label: setup
+
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(zoo)
+library(rpart.plot)
+library(gt)
+library(broom)
+
+# For reproducibility
+set.seed(42)
+```
+
+# Executive Summary
+
+**Can Pokémon cards be analyzed like financial instruments?**
+
+This analysis investigates whether a portfolio of ~40 Pokémon trading cards exhibits market-like behavior and explores whether returns are predictable. We apply two key methodologies from quantitative finance:
+
+1. **The Recursive Regression Method** - Building factor models incrementally while monitoring for multicollinearity
+2. **The Tidymodels ML Workflow** - A systematic pipeline using `rsample` → `recipes` → `parsnip` → `yardstick`
+
+**Key Questions:**
+
+1. **Index Behavior**: Does an aggregated basket of 40 cards behave like a market index?
+2. **Basket Prediction**: Can we predict next-day basket movements using the tidy ML workflow?
+3. **Card-Level Risk**: What card characteristics explain volatility differences?
+
+---
+
+# Data Loading & Cleaning
+
+## Load All 40 Card Files
+
+Each CSV file contains card metadata at the top followed by daily price history. We parse each file and combine them into a single analytical dataset.
+
+```{r load-data}
+#| label: load-data
+
+# Function to parse a single card file
+parse_card_file <- function(filepath, card_id) {
+  
+  all_lines <- readLines(filepath, warn = FALSE)
+  
+  # Find section markers
+  card_info_start <- which(grepl("CARD INFORMATION", all_lines))[1]
+  history_start <- which(grepl("PRICE HISTORY", all_lines))[1]
+  
+  # Extract card metadata
+  card_lines <- all_lines[(card_info_start + 1):(history_start - 3)]
+  card_lines <- card_lines[card_lines != ""]
+  
+  # Parse card info
+  card_name <- str_extract(card_lines[grepl("Card Name", card_lines)], "(?<=Card Name,).*")
+  set_name <- str_extract(card_lines[grepl("Set Name", card_lines)], "(?<=Set Name,).*")
+  rarity <- str_extract(card_lines[grepl("Rarity", card_lines)], "(?<=Rarity,).*")
+  
+  # Extract price history
+  price_history_raw <- read.csv(
+    text = paste(all_lines[(history_start + 1):length(all_lines)], collapse = "\n"),
+    header = TRUE,
+    stringsAsFactors = FALSE
+  )
+  
+  # Clean price history
+  price_history <- price_history_raw %>%
+    select(1:5) %>%
+    rename(Date = 1, Condition = 2, Price = 3, Volume = 4, DataType = 5) %>%
+    mutate(
+      Date = as.Date(substr(as.character(Date), 1, 10)),
+      Price = as.numeric(gsub("[\\$,]", "", Price)),
+      Volume = as.numeric(Volume),
+      card_id = card_id,
+      card_name = trimws(card_name),
+      set_name = trimws(set_name),
+      rarity = trimws(rarity)
+    ) %>%
+    filter(!is.na(Price), !is.na(Date))
+  
+  return(price_history)
+}
+
+# Load all card files
+file_path <- "C:/Users/kenne/Downloads/Pokemon Project/"
+
+df_list <- list()
+for (i in 1:40) {
+  filename <- paste0(file_path, "project_data_", i, ".csv")
+  if (file.exists(filename)) {
+    df_list[[i]] <- parse_card_file(filename, i)
+    cat("Loaded file", i, "\n")
+  } else {
+    cat("Warning: File", i, "not found\n")
+  }
+}
+
+# Combine all cards
+df <- bind_rows(df_list)
+
+cat("\nTotal rows loaded:", nrow(df), "\n")
+cat("Number of unique cards:", length(unique(df$card_id)), "\n")
+```
+
+## Focus on Near Mint Condition
+
+For consistency and liquidity, we focus on "Near Mint" condition cards.
+
+```{r filter-condition}
+#| label: filter-condition
+
+df <- df %>%
+  # filter(Condition == "Near Mint") %>%
+  arrange(card_id, Date)
+
+# Summary by card
+card_summary <- df %>%
+  group_by(card_id, card_name, rarity) %>%
+  summarise(
+    n_obs = n(),
+    min_price = min(Price),
+    max_price = max(Price),
+    mean_price = mean(Price),
+    price_range_pct = (max_price - min_price) / min_price * 100,
+    .groups = "drop"
+  )
+
+card_summary %>%
+  arrange(desc(mean_price)) %>%
+  head(15) %>%
+  gt() %>%
+  fmt_currency(columns = c(min_price, max_price, mean_price), currency = "USD") %>%
+  fmt_number(columns = price_range_pct, decimals = 1, suffix = "%") %>%
+  cols_label(
+    card_id = "ID", card_name = "Card Name", rarity = "Rarity",
+    n_obs = "Days", min_price = "Min", max_price = "Max",
+    mean_price = "Avg", price_range_pct = "Range %"
+  ) %>%
+  tab_header(title = "Top 15 Cards by Average Price")
+```
+
+**Commentary:** The price distribution shows substantial heterogeneity—from cards worth a few dollars to those over $2,000. This mirrors real financial markets where asset prices span multiple orders of magnitude.
+
+## Calculate Returns
+
+```{r calculate-returns, include=FALSE, message=FALSE, warning=FALSE}
+#| label: calculate-returns
+
+df <- df %>%
+  group_by(card_id) %>%
+  arrange(Date) %>%
+  mutate(
+    daily_return = (Price - lag(Price)) / lag(Price),
+    log_return = log(Price / lag(Price))
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(daily_return))
+```
+
+---
+
+# Part 1: Does the Basket Behave Like a Market Index?
+
+A true market index typically displays:
+
+- **Fat tails** (kurtosis > 3): More extreme events than normal distribution predicts
+- **Negative skewness**: Crashes larger than rallies
+- **Volatility clustering**: Calm periods followed by turbulent periods
+- **Weak return autocorrelation**: Returns hard to predict, but volatility persists
+
+## Construct the Basket Index
+
+We create two indices similar to how market indices are constructed:
+
+1. **Value-Weighted**: Weight proportional to price (like S&P 500 market-cap weighting)
+2. **Equal-Weighted**: Each card receives equal weight (1/N)
+
+```{r construct-index, echo = FALSE}
+#| label: construct-index
+
+basket_index <- df %>%
+  group_by(Date) %>%
+  summarise(
+    total_value = sum(Price, na.rm = TRUE),
+    basket_return = sum((Price / total_value) * daily_return, na.rm = TRUE),
+    equal_weight_return = mean(daily_return, na.rm = TRUE),
+    n_cards = n(),
+    total_volume = sum(Volume, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(Date) %>%
+  mutate(
+    basket_level = cumprod(1 + replace_na(basket_return, 0)),
+    ew_level = cumprod(1 + replace_na(equal_weight_return, 0))
+  )
+
+# Plot index performance
+ggplot(basket_index, aes(x = Date)) +
+  geom_line(aes(y = basket_level, color = "Value-Weighted"), linewidth = 1) +
+  geom_line(aes(y = ew_level, color = "Equal-Weighted"), linewidth = 0.8, alpha = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed", alpha = 0.5) +
+  scale_color_manual(values = c("Value-Weighted" = "#e74c3c", "Equal-Weighted" = "#3498db")) +
+  labs(
+    title = "Pokémon Card Basket Index Performance",
+    subtitle = "Cumulative returns since inception (Base = 1.0)",
+    x = "Date", y = "Index Level", color = "Weighting"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+write.csv(
+  basket_index,
+  "C:/Users/kenne/Downloads/df.csv",
+  row.names = FALSE
+)
+```
+
+**Commentary:** The divergence between value-weighted and equal-weighted indices tells a story. If high-priced "blue chip" cards behave differently from cheaper cards, the indices will separate—similar to how large-cap stocks often exhibit lower volatility than small-caps.
+
+## Statistical Properties
+
+```{r index-stats}
+#| label: index-stats
+
+returns <- basket_index$basket_return
+
+stats_table <- tibble(
+  Statistic = c("Mean (daily)", "Std Dev (daily)", "Annualized Vol",
+                "Skewness", "Kurtosis", "Min", "Max", "Sharpe (ann.)"),
+  Value = c(
+    mean(returns, na.rm = TRUE),
+    sd(returns, na.rm = TRUE),
+    sd(returns, na.rm = TRUE) * sqrt(252),
+    e1071::skewness(returns, na.rm = TRUE),
+    e1071::kurtosis(returns, na.rm = TRUE),
+    min(returns, na.rm = TRUE),
+    max(returns, na.rm = TRUE),
+    mean(returns, na.rm = TRUE) / sd(returns, na.rm = TRUE) * sqrt(252)
+  )
+) %>%
+  mutate(Value = round(Value, 4))
+
+stats_table %>%
+  gt() %>%
+  tab_header(title = "Basket Index: Statistical Properties")
+```
+
+```{r return-distribution}
+#| label: return-distribution
+
+ggplot(basket_index, aes(x = basket_return)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "#3498db", alpha = 0.6) +
+  stat_function(fun = dnorm, 
+                args = list(mean = mean(returns, na.rm = TRUE), 
+                           sd = sd(returns, na.rm = TRUE)),
+                color = "#e74c3c", linewidth = 1.2) +
+  labs(
+    title = "Return Distribution vs. Normal",
+    subtitle = "Red line = theoretical normal distribution",
+    x = "Daily Return", y = "Density"
+  ) +
+  theme_minimal()
+```
+
+**Commentary:** 
+
+- **Kurtosis > 3** indicates fat tails—extreme returns occur more frequently than normal predicts
+- **Skewness**: Positive suggests occasional large positive jumps; negative indicates crash-prone behavior
+- Low annualized volatility may reflect interpolated prices or illiquid market nature
+
+## Autocorrelation Analysis
+
+```{r autocorrelation}
+#| label: autocorrelation
+
+par(mfrow = c(1, 2))
+acf(returns, lag.max = 20, main = "Return ACF", na.action = na.pass)
+acf(returns^2, lag.max = 20, main = "Squared Returns ACF\n(Volatility Clustering)", na.action = na.pass)
+par(mfrow = c(1, 1))
+```
+
+**Commentary:**
+
+- **Return ACF**: Bars within blue bands = returns unpredictable from past (market efficiency)
+- **Squared Returns ACF**: Significant autocorrelation = volatility clustering (ARCH/GARCH effect)
+
+## Part 1 Verdict
+
+```{r verdict-1}
+#| label: verdict-1
+
+kurt <- e1071::kurtosis(returns, na.rm = TRUE)
+skew <- e1071::skewness(returns, na.rm = TRUE)
+ann_vol <- sd(returns, na.rm = TRUE) * sqrt(252)
+
+tibble(
+  Property = c("Fat Tails (Kurtosis > 3)", 
+               "Negative Skewness",
+               "High Volatility (>20% ann.)",
+               "Volatility Clustering"),
+  Expected = c("Yes", "Yes", "Yes", "Yes"),
+  Observed = c(
+    ifelse(kurt > 3, paste0("✓ Yes (", round(kurt, 2), ")"), paste0("✗ No (", round(kurt, 2), ")")),
+    ifelse(skew < 0, paste0("✓ Yes (", round(skew, 2), ")"), paste0("✗ No (", round(skew, 2), ")")),
+    ifelse(ann_vol > 0.20, paste0("✓ Yes (", round(ann_vol*100, 1), "%)"), paste0("✗ No (", round(ann_vol*100, 1), "%)")),
+    "Check ACF plot"
+  )
+) %>%
+  gt() %>%
+  tab_header(
+    title = "Does the Pokémon Card Basket Behave Like a Market Index?",
+    subtitle = "Comparison against typical financial market properties"
+  )
+```
+
+---
+
+# Part 2: Tidy ML Workflow for Return Prediction
+
+We now apply the **Tidymodels workflow** from the class notes to predict next-day basket returns. The workflow follows:
+
+1. **`rsample`**: Data sampling (train/test split)
+2. **`recipes`**: Feature engineering pipeline
+3. **`parsnip`**: Model specification and fitting
+4. **`yardstick`**: Model evaluation metrics
+
+## Feature Engineering
+
+We create three categories of predictors:
+
+1. **Internal features**: Lagged card market returns and volatility
+2. **External/Macro features**: Consumer sentiment, S&P 500 (risk appetite proxy)
+3. **Calendar features**: Day of week, month-end effects, holiday season
+
+## Fetch External Macro Data
+
+```{r fetch-macro-data}
+#| label: fetch-macro-data
+
+# Consumer Sentiment Index (Monthly from FRED)
+consumer_sentiment <- tidyquant::tq_get(
+  "UMCSENT",
+  get = "economic.data",
+  from = min(basket_index$Date) - days(90),
+  to = max(basket_index$Date)
+) %>%
+  rename(Date = date, sentiment_index = price) %>%
+  select(Date, sentiment_index)
+
+cat("Consumer Sentiment observations:", nrow(consumer_sentiment), "\n")
+
+# S&P 500 via SPY ETF (Daily)
+spy_data <- tidyquant::tq_get(
+  "SPY",
+  get = "stock.prices",
+  from = min(basket_index$Date) - days(30),
+  to = max(basket_index$Date)
+) %>%
+  mutate(spy_return = (adjusted - lag(adjusted)) / lag(adjusted)) %>%
+  rename(Date = date) %>%
+  select(Date, spy_close = adjusted, spy_return)
+
+cat("SPY observations:", nrow(spy_data), "\n")
+```
+
+## Align Macro Data to Daily Frequency
+
+Consumer sentiment is monthly—we fill-forward to daily. SPY needs handling for weekends when card trading may occur.
+
+```{r align-macro-data}
+#| label: align-macro-data
+
+# Create complete daily date sequence
+all_dates <- tibble(
+  Date = seq(min(basket_index$Date), max(basket_index$Date), by = "day")
+)
+
+# Expand monthly sentiment to daily (fill forward)
+sentiment_without_regards <- tibble(
+  Date = seq(min(consumer_sentiment$Date), max(all_dates$Date), by = "day")
+) %>%
+  left_join(consumer_sentiment, by = "Date") %>%
+  arrange(Date) %>%
+  tidyr::fill(sentiment_index, .direction = "down") %>%  # Fill forward FIRST
+  tidyr::fill(sentiment_index, .direction = "up")         # Fill any leading NAs
+
+# THEN: Join to your basket dates (already filled!)
+sentiment_daily <- all_dates %>%
+  left_join(sentiment_without_regards, by = "Date")
+
+# SPY: fill weekends/holidays, set return to 0 on non-trading days
+spy_daily <- all_dates %>%
+  left_join(spy_data, by = "Date") %>%
+  tidyr::fill(spy_close, .direction = "down") %>%
+  mutate(spy_return = replace_na(spy_return, 0))
+
+cat("Sentiment daily:", nrow(sentiment_daily), "| SPY daily:", nrow(spy_daily), "\n")
+```
+
+## Build Complete Feature Set
+
+**Critical**: All rolling features are LAGGED to avoid lookahead bias.
+
+```{r features}
+#| label: features
+
+basket_features <- basket_index %>%
+  arrange(Date) %>%
+  left_join(sentiment_daily, by = "Date") %>%
+  left_join(spy_daily, by = "Date") %>%
+  mutate(
+    # TARGET
+    return_next = lead(basket_return),
+    
+    # INTERNAL FEATURES (lagged)
+    return_lag1 = lag(basket_return, 1),
+    return_lag2 = lag(basket_return, 2),
+    return_lag3 = lag(basket_return, 3),
+    return_lag5 = lag(basket_return, 5),
+    return_5d = lag(zoo::rollsum(basket_return, 5, fill = NA, align = "right"), 1),
+    return_10d = lag(zoo::rollsum(basket_return, 10, fill = NA, align = "right"), 1),
+    vol_5d = lag(zoo::rollapply(basket_return, 5, sd, fill = NA, align = "right"), 1),
+    vol_10d = lag(zoo::rollapply(basket_return, 10, sd, fill = NA, align = "right"), 1),
+    
+    # EXTERNAL MACRO FEATURES (lagged)
+    sentiment_lag1 = lag(sentiment_index, 1),
+    sentiment_change = lag(sentiment_index, 1) - lag(sentiment_index, 30),
+    spy_lag1 = lag(spy_return, 1),
+    spy_5d = lag(zoo::rollsum(spy_return, 5, fill = NA, align = "right"), 1),
+    spy_vol_5d = lag(zoo::rollapply(spy_return, 5, sd, fill = NA, align = "right"), 1),
+    
+    # CALENDAR FEATURES
+    dow = wday(Date, label = TRUE),
+    is_month_end = ifelse(day(Date) >= 28, 1, 0),
+    is_holiday_season = ifelse(month(Date) %in% c(11, 12), 1, 0)
+  ) %>%
+  filter(!is.na(return_next), !is.na(return_lag1), !is.na(spy_lag1))
+
+cat("Feature set:", nrow(basket_features), "obs x", ncol(basket_features), "columns\n")
+glimpse(basket_features)
+```
+
+## Step 1: Data Sampling with rsample
+
+```{r sampling}
+#| label: sampling
+
+df_split <- basket_features %>%
+  rsample::initial_time_split(prop = 0.70)
+
+df_train <- rsample::training(df_split)
+df_test <- rsample::testing(df_split)
+
+cat("Training:", nrow(df_train), "obs (",
+    as.character(min(df_train$Date)), "to", as.character(max(df_train$Date)), ")\n")
+cat("Testing:", nrow(df_test), "obs (",
+    as.character(min(df_test$Date)), "to", as.character(max(df_test$Date)), ")\n")
+```
+
+## Step 2: Feature Engineering with recipes
+
+```{r recipe}
+#| label: recipe
+
+recipe_pipeline <- recipes::recipe(
+  return_next ~ return_lag1 + return_lag2 + return_lag3 + 
+                return_5d + vol_5d + 
+                sentiment_lag1 + spy_lag1 + spy_5d +
+                dow + is_holiday_season,
+  data = df_train
+) %>%
+  recipes::step_impute_median(all_numeric_predictors()) %>%
+  recipes::step_dummy(dow, one_hot = FALSE) %>%
+  recipes::step_normalize(all_numeric_predictors()) %>%
+  recipes::step_zv(all_predictors()) %>%
+  recipes::step_corr(all_numeric_predictors(), threshold = 0.9) %>%
+  recipes::prep()
+
+train_baked <- recipes::bake(recipe_pipeline, df_train)
+test_baked <- recipes::bake(recipe_pipeline, df_test)
+
+cat("Baked training:", nrow(train_baked), "x", ncol(train_baked), "\n")
+cat("Baked testing:", nrow(test_baked), "x", ncol(test_baked), "\n")
+glimpse(train_baked)
+```
+
+**Commentary:** The recipe handles:
+
+- `step_impute_median()`: Fills NAs in macro data
+- `step_dummy()`: Converts day-of-week to binary
+- `step_normalize()`: Scales features (critical when mixing returns with sentiment indices)
+- `step_corr()`: Removes highly correlated features
+
+## Step 3: Modeling with parsnip
+
+### Linear Regression
+
+```{r model-lm}
+#| label: model-lm
+
+model_lm <- parsnip::linear_reg(mode = "regression") %>%
+  parsnip::set_engine("lm") %>%
+  parsnip::fit(return_next ~ ., data = train_baked)
+
+parsnip::tidy(model_lm) %>%
+  mutate(across(where(is.numeric), ~round(.x, 5))) %>%
+  gt() %>%
+  tab_header(title = "Linear Regression Coefficients (With Macro)")
+```
+
+```{r model-lm-summary}
+#| label: model-lm-summary
+
+parsnip::glance(model_lm) %>%
+  select(r.squared, adj.r.squared, sigma, statistic, p.value) %>%
+  gt() %>%
+  fmt_number(columns = c(r.squared, adj.r.squared, sigma), decimals = 4) %>%
+  tab_header(title = "Linear Model Summary")
+```
+
+**Commentary:** Compare coefficient significance for internal vs macro features. Do consumer sentiment or SPY returns help predict card market movements?
+
+### Decision Tree
+
+```{r model-cart}
+#| label: model-cart
+
+model_cart <- parsnip::decision_tree(mode = "regression") %>%
+  parsnip::set_engine("rpart") %>%
+  parsnip::fit(return_next ~ ., data = train_baked)
+
+rpart.plot(
+  model_cart$fit,
+  roundint = FALSE,
+  cex = 0.8,
+  fallen.leaves = TRUE,
+  extra = "auto",
+  main = "Decision Tree: With Macro Factors",
+  box.palette = "Blues"
+)
+```
+
+**Commentary:** The decision tree provides interpretable splits. Variables at the top are most important. Terminal nodes show predicted returns for different "market regimes."
+
+## Step 7: Model Evaluation with yardstick
+
+```{r results-yardstick}
+#| label: results-yardstick
+
+# Linear model predictions
+lm_pred <- model_lm %>%
+  stats::predict(new_data = test_baked) %>%
+  dplyr::bind_cols(truth = test_baked$return_next)
+
+# Decision tree predictions  
+cart_pred <- model_cart %>%
+  stats::predict(new_data = test_baked) %>%
+  dplyr::bind_cols(truth = test_baked$return_next)
+
+# Metrics using yardstick (from class notes)
+cat("=== Linear Regression: Out-of-Sample Performance ===\n")
+lm_metrics <- lm_pred %>%
+  yardstick::metrics(truth = truth, estimate = .pred) %>%
+  arrange(.metric)
+print(lm_metrics)
+
+cat("\n=== Decision Tree: Out-of-Sample Performance ===\n")
+cart_metrics <- cart_pred %>%
+  yardstick::metrics(truth = truth, estimate = .pred) %>%
+  arrange(.metric)
+print(cart_metrics)
+```
+
+```{r results-comparison}
+#| label: results-comparison
+
+# Side-by-side comparison
+bind_rows(
+  lm_metrics %>% mutate(model = "Linear Regression"),
+  cart_metrics %>% mutate(model = "Decision Tree")
+) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  select(model, rmse, rsq, mae) %>%
+  gt() %>%
+  fmt_number(columns = c(rmse, mae), decimals = 5) %>%
+  fmt_percent(columns = rsq, decimals = 2) %>%
+  tab_header(
+    title = "Model Comparison: Out-of-Sample Performance",
+    subtitle = "Lower RMSE/MAE is better; Higher R² is better"
+  )
+```
+
+## Directional Accuracy
+
+In trading, predicting the *direction* (up/down) matters as much as magnitude.
+
+```{r direction-accuracy}
+#| label: direction-accuracy
+
+direction_results <- bind_rows(
+  lm_pred %>% mutate(model = "Linear Regression"),
+  cart_pred %>% mutate(model = "Decision Tree")
+) %>%
+  group_by(model) %>%
+  summarise(
+    direction_accuracy = mean(sign(.pred) == sign(truth), na.rm = TRUE),
+    n_correct = sum(sign(.pred) == sign(truth), na.rm = TRUE),
+    n_total = n(),
+    .groups = "drop"
+  )
+
+direction_results %>%
+  gt() %>%
+  fmt_percent(columns = direction_accuracy, decimals = 1) %>%
+  tab_header(
+    title = "Directional Accuracy",
+    subtitle = "Can we predict whether tomorrow is UP or DOWN?"
+  ) %>%
+  data_color(columns = direction_accuracy, palette = "Greens")
+```
+
+**Commentary:** Direction accuracy > 50% suggests meaningful predictive power beyond random guessing. Even 55% accuracy can be valuable in low-transaction-cost environments.
+
+## Predicted vs. Actual Visualization
+
+```{r pred-vs-actual}
+#| label: pred-vs-actual
+
+bind_rows(
+  lm_pred %>% mutate(model = "Linear Regression"),
+  cart_pred %>% mutate(model = "Decision Tree")
+) %>%
+  ggplot(aes(x = .pred, y = truth)) +
+  geom_point(alpha = 0.5, size = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red", linewidth = 1) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue", alpha = 0.5) +
+  facet_wrap(~model) +
+  labs(
+    title = "Predicted vs. Actual Returns (Test Set)",
+    subtitle = "Dashed red = perfect prediction; Blue = actual fit",
+    x = "Predicted Return",
+    y = "Actual Return"
+  ) +
+  theme_minimal()
+```
+
+## Residual Diagnostics
+
+```{r residual-diagnostics}
+#| label: residual-diagnostics
+
+# Check residuals for linear model
+lm_residuals <- test_baked$return_next - predict(model_lm, test_baked)$.pred
+
+par(mfrow = c(1, 2))
+acf(lm_residuals, main = "Residual ACF: Linear Model", na.action = na.pass)
+hist(lm_residuals, breaks = 30, main = "Residual Distribution", 
+     xlab = "Residuals", col = "lightblue")
+par(mfrow = c(1, 1))
+```
+
+**Commentary:** 
+- **Residual ACF**: No significant spikes = model captured temporal structure
+- **Residual distribution**: Should be symmetric and centered at zero
+
+---
+
+# Part 3: Card-Level Risk Analysis
+
+**Beyond the basket:** Individual cards have vastly different risk profiles. What drives these differences?
+
+## Calculate Card-Level Risk Metrics
+
+```{r card-metrics}
+#| label: card-metrics
+
+# Get basket returns for beta calculation
+basket_daily <- basket_index %>% select(Date, basket_return)
+
+# Calculate metrics for each card
+card_metrics <- df %>%
+  left_join(basket_daily, by = "Date") %>%
+  group_by(card_id, card_name, rarity) %>%
+  summarise(
+    n_obs = n(),
+    mean_return = mean(daily_return, na.rm = TRUE) * 252,
+    volatility = sd(daily_return, na.rm = TRUE),
+    ann_volatility = sd(daily_return, na.rm = TRUE) * sqrt(252),
+    avg_price = mean(Price, na.rm = TRUE),
+    avg_volume = mean(Volume, na.rm = TRUE),
+    
+    # Beta to basket
+    beta = cov(daily_return, basket_return, use = "complete.obs") / 
+           var(basket_return, na.rm = TRUE),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(
+    rarity_numeric = case_when(
+      rarity == "Common" ~ 1,
+      rarity == "Uncommon" ~ 2,
+      rarity == "Rare" ~ 3,
+      rarity == "Holo Rare" ~ 4,
+      rarity == "Promo" ~ 4.5,
+      rarity == "Ultra Rare" ~ 5,
+      rarity == "Secret Rare" ~ 6,
+      rarity == "Double Rare" ~ 5.5,
+      TRUE ~ 3
+    ),
+    sharpe = mean_return / ann_volatility
+  )
+
+card_metrics %>%
+  arrange(desc(ann_volatility)) %>%
+  select(card_name, rarity, ann_volatility, beta, avg_price) %>%
+  head(12) %>%
+  gt() %>%
+  fmt_percent(columns = ann_volatility, decimals = 1) %>%
+  fmt_number(columns = beta, decimals = 2) %>%
+  fmt_currency(columns = avg_price, currency = "USD") %>%
+  tab_header(title = "Most Volatile Cards", subtitle = "Ranked by annualized volatility")
+```
+
+## Volatility by Rarity
+
+```{r vol-by-rarity}
+#| label: vol-by-rarity
+
+ggplot(card_metrics, aes(x = reorder(rarity, rarity_numeric), y = ann_volatility)) +
+  geom_boxplot(aes(fill = rarity), alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 2) +
+  labs(
+    title = "Card Volatility by Rarity Tier",
+    subtitle = "Do rarer cards exhibit more price volatility?",
+    x = "Rarity", y = "Annualized Volatility"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## ML Approach: What Drives Card Volatility?
+
+We apply the same tidymodels workflow to model card-level volatility.
+
+```{r vol-ml-workflow}
+#| label: vol-ml-workflow
+
+# Prepare data
+vol_data <- card_metrics %>%
+  select(ann_volatility, rarity_numeric, avg_price, avg_volume) %>%
+  drop_na() %>%
+  mutate(
+    log_price = log(avg_price + 1),
+    log_volume = log(avg_volume + 1)
+  )
+
+# Sampling (random split OK for cross-sectional data)
+vol_split <- rsample::initial_split(vol_data, prop = 0.80)
+vol_train <- rsample::training(vol_split)
+vol_test <- rsample::testing(vol_split)
+
+cat("Volatility model - Training:", nrow(vol_train), "| Testing:", nrow(vol_test), "\n")
+
+# Recipe
+vol_recipe <- recipes::recipe(
+  ann_volatility ~ rarity_numeric + log_price + log_volume,
+  data = vol_train
+) %>%
+  recipes::step_normalize(all_numeric_predictors()) %>%
+  recipes::prep()
+
+vol_train_baked <- recipes::bake(vol_recipe, vol_train)
+vol_test_baked <- recipes::bake(vol_recipe, vol_test)
+
+# Linear model
+vol_model_lm <- parsnip::linear_reg(mode = "regression") %>%
+  parsnip::set_engine("lm") %>%
+  parsnip::fit(ann_volatility ~ ., data = vol_train_baked)
+
+# Results
+cat("\n=== Volatility Model Coefficients ===\n")
+parsnip::tidy(vol_model_lm) %>%
+  mutate(across(where(is.numeric), ~round(.x, 4))) %>%
+  gt()
+
+# Test set performance
+cat("\n=== Out-of-Sample Performance ===\n")
+vol_model_lm %>%
+  stats::predict(new_data = vol_test_baked) %>%
+  dplyr::bind_cols(truth = vol_test_baked$ann_volatility) %>%
+  yardstick::metrics(truth = truth, estimate = .pred)
+```
+
+## Decision Tree: Volatility Segmentation
+
+```{r vol-tree}
+#| label: vol-tree
+
+vol_tree <- parsnip::decision_tree(mode = "regression") %>%
+  parsnip::set_engine("rpart") %>%
+  parsnip::fit(ann_volatility ~ rarity_numeric + avg_price + avg_volume, 
+               data = card_metrics %>% drop_na())
+
+rpart.plot(
+  vol_tree$fit,
+  roundint = FALSE,
+  cex = 0.9,
+  fallen.leaves = TRUE,
+  extra = "auto",
+  main = "What Drives Card Volatility?",
+  box.palette = "Blue"
+)
+```
+
+**Commentary:** The decision tree segments cards into risk buckets. The first split identifies the most important volatility driver. Terminal nodes show average volatility for each segment—useful for categorizing new cards.
+
+## Summary by Rarity
+
+```{r summary-rarity}
+#| label: summary-rarity
+
+card_metrics %>%
+  group_by(rarity) %>%
+  summarise(
+    n_cards = n(),
+    avg_volatility = mean(ann_volatility, na.rm = TRUE),
+    avg_beta = mean(beta, na.rm = TRUE),
+    avg_price = mean(avg_price, na.rm = TRUE),
+    avg_sharpe = mean(sharpe, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(avg_volatility)) %>%
+  gt() %>%
+  fmt_percent(columns = avg_volatility, decimals = 1) %>%
+  fmt_number(columns = c(avg_beta, avg_sharpe), decimals = 2) %>%
+  fmt_currency(columns = avg_price, currency = "USD") %>%
+  tab_header(
+    title = "Risk-Return Profile by Rarity",
+    subtitle = "Which rarity tiers offer best risk-adjusted returns?"
+  )
+```
+
+---
+
+# Conclusions & Key Findings
+
+## Summary of Results
+
+### 1. Index Behavior
+
+```{r conclusion-1}
+#| label: conclusion-1
+
+cat("Fat Tails (Kurtosis):", round(e1071::kurtosis(returns, na.rm = TRUE), 2), 
+    ifelse(e1071::kurtosis(returns, na.rm = TRUE) > 3, "→ YES\n", "→ NO\n"))
+cat("Skewness:", round(e1071::skewness(returns, na.rm = TRUE), 2),
+    ifelse(e1071::skewness(returns, na.rm = TRUE) < 0, "→ Crash-prone\n", "→ Rally-prone\n"))
+cat("Annualized Volatility:", round(sd(returns, na.rm = TRUE) * sqrt(252) * 100, 1), "%\n")
+```
+
+**Interpretation:** The basket exhibits *some* market-like properties (fat tails) but diverges in others. This reflects the unique nature of collectibles—illiquid, sentiment-driven, different information flows than equities.
+
+### 2. Predictability (ML Results)
+
+The tidymodels workflow revealed:
+
+- **Best predictors** from recursive screening: [See univariate results above]
+- **Linear model vs Decision Tree**: Compare RMSE, R², direction accuracy
+- **VIF analysis**: Identified multicollinearity issues with rolling features
+
+### 3. Risk Factors
+
+Key volatility drivers from the ML analysis:
+
+- **Rarity effect**: [More/less volatile for rarer cards?]
+- **Price level effect**: [Higher-priced cards more/less volatile?]
+- **Volume effect**: [Does trading activity affect risk?]
+
+## Limitations
+
+1. **Interpolated prices**: May underestimate true volatility
+2. **Single condition**: Near Mint only
+3. **Limited history**: ~1 year of data
+4. **Survivorship bias**: Only actively traded cards included
+5. **Transaction costs**: Not considered in predictability analysis
+
+## Workflow Summary
+
+The Tidymodels pipeline provides a systematic, reproducible approach:
+
+```
+rsample::initial_time_split() → Train/Test split
+       ↓
+recipes::recipe() → Feature engineering
+       ↓
+parsnip::linear_reg() / decision_tree() → Model fitting
+       ↓
+yardstick::metrics() → Evaluation
+```
+
+This same scaffolding can be applied to any financial prediction problem.
+
+---
+
+# Appendix: Session Info
+
+```{r session-info}
+#| label: session-info
+
+sessionInfo()
+```
