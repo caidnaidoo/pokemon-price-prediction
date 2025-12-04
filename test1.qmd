@@ -265,11 +265,32 @@ tibble(
 
 # Part 2: Predictability Analysis
 
+**Main question :** Can we predict the Pokemon basket's next-day return using historical patterns and macroeconomic factors?
+
+In order to do this, we ran a Recursive Regression to find the most impactful variable, and feed into the ML workflow in order to find the in and out-of-sample fit.
+
 ## 2.1 Feature Engineering
 
-```{r fetch-macro}
-#| label: fetch-macro
+We build the feature based on the following classification of assumptions : 
 
+**1. Momentum Features (Hypothesis: Past returns predict future returns)**
+
+Features Created:
+
+- `return_lag1, return_lag2, return_lag3` - Recent 1-3 day returns
+- `return_5d` - Cumulative 5-day momentum
+
+The assumption is that momentum exist and because of the inefficient nature of the Pokemon market, prices adjust slowly to new information.  
+
+**2. Volatility Features (Hypothesis: Recent volatility predicts future returns)**
+
+Features Created:
+
+- `vol_5d` - 5-day rolling standard deviation of returns
+
+The assumption is that recent volatility is a proxy for “risk & excitement” in the market .We assume that a higher recent volatility change might be systematically linked to next-day returns, even if the sign is ambiguous.
+
+```{r building the features, include = FALSE}
 consumer_sentiment <- tidyquant::tq_get(
   "UMCSENT", get = "economic.data",
   from = min(basket_index$Date) - days(90), to = max(basket_index$Date)
@@ -293,10 +314,6 @@ sentiment_daily <- tibble(Date = seq(min(consumer_sentiment$Date), max(all_dates
 spy_daily <- all_dates %>%
   left_join(spy_data, by = "Date") %>%
   mutate(spy_return = replace_na(spy_return, 0))
-```
-
-```{r build-features}
-#| label: build-features
 
 basket_features <- basket_index %>%
   left_join(sentiment_daily, by = "Date") %>%
@@ -511,18 +528,6 @@ parsnip::glance(model_lm) %>%
   tab_header(title = "In-Sample Model Fit")
 ```
 
-#### Decision Tree
-
-```{r model-cart}
-#| label: model-cart
-
-model_cart <- parsnip::decision_tree(mode = "regression") %>%
-  parsnip::set_engine("rpart") %>%
-  parsnip::fit(return_next ~ ., data = train_baked)
-
-rpart.plot(model_cart$fit, roundint = FALSE, cex = 0.8,
-           main = "Decision Tree: Return Prediction", box.palette = "Blues")
-```
 
 ### Step 4: Model Evaluation (yardstick)
 
@@ -530,14 +535,11 @@ rpart.plot(model_cart$fit, roundint = FALSE, cex = 0.8,
 #| label: evaluation
 
 lm_pred <- predict(model_lm, test_baked) %>% bind_cols(truth = test_baked$return_next)
-cart_pred <- predict(model_cart, test_baked) %>% bind_cols(truth = test_baked$return_next)
 
 lm_metrics <- lm_pred %>% yardstick::metrics(truth = truth, estimate = .pred)
-cart_metrics <- cart_pred %>% yardstick::metrics(truth = truth, estimate = .pred)
 
 bind_rows(
   lm_metrics %>% mutate(model = "Linear Regression"),
-  cart_metrics %>% mutate(model = "Decision Tree")
 ) %>%
   pivot_wider(names_from = .metric, values_from = .estimate) %>%
   select(model, rmse, rsq, mae) %>%
@@ -554,7 +556,6 @@ bind_rows(
 
 bind_rows(
   lm_pred %>% mutate(model = "Linear Regression"),
-  cart_pred %>% mutate(model = "Decision Tree")
 ) %>%
   ggplot(aes(x = .pred, y = truth)) +
   geom_point(alpha = 0.5) +
@@ -740,34 +741,29 @@ Does the basket model generalize to individual cards? We test on Umbreon VMax Al
 
 ## Extract Umbreon Data
 
-```{r card6-data}
-#| label: card6-data
-
-card_6_data <- df %>%
+```{r high_volume_data}
+hv_data <- df %>%
   filter(card_id == 76, Condition == "Near Mint") %>%
   arrange(Date) %>%
   select(Date, Price, daily_return, card_name, set_name, rarity, DataType) %>%
   drop_na(daily_return)
 
-card_6_data_actual <- card_6_data 
+hv_data_actual <- hv_data 
   # filter(DataType == "Actual Sale")  # ← KEY FILTER
 
 cat("\n=== After Filtering to Actual Sales ===\n")
-cat("Actual sale observations:", nrow(card_6_data_actual), "\n")
-cat("Removed interpolated:", nrow(card_6_data) - nrow(card_6_data_actual), "observations\n")
+cat("Actual sale observations:", nrow(hv_data_actual), "\n")
 
-cat("=== CARD 6 INFO ===\n")
-cat("Card Name:", unique(card_6_data$card_name)[1], "\n")
-cat("Set:", unique(card_6_data$set_name)[1], "\n")
-cat("Observations:", nrow(card_6_data), "\n")
+cat("=== High Value ===\n")
+cat("Card Name:", unique(hv_data$card_name)[1], "\n")
+cat("Set:", unique(hv_data$set_name)[1], "\n")
+cat("Observations:", nrow(hv_data), "\n")
 ```
 
 ## Feature Engineering
 
-```{r card6-features}
-#| label: card6-features
-
-card_6_features <- card_6_data_actual %>%
+```{r high_volume_features}
+hv_features <- hv_data_actual %>%
   left_join(sentiment_daily, by = "Date") %>%
   left_join(spy_daily, by = "Date") %>%
   mutate(
@@ -809,62 +805,56 @@ card_6_features <- card_6_data_actual %>%
   ) %>%
   filter(!is.na(return_next), !is.na(vol_5d), !is.na(spy_lag1))
 
-cat("Card 6 features:", nrow(card_6_features), "observations\n")
+cat("High Value features:", nrow(hv_features), "observations\n")
 ```
 
 ## Train/Test Split & Apply Model
 
-```{r card6-model}
-#| label: card6-model
+```{r high_volume_model}
+hv_split <- rsample::initial_time_split(hv_features, prop = 0.70)
+hv_train <- rsample::training(hv_split)
+hv_test <- rsample::testing(hv_split)
 
-card6_split <- rsample::initial_time_split(card_6_features, prop = 0.70)
-card6_train <- rsample::training(card6_split)
-card6_test <- rsample::testing(card6_split)
+cat("High Value - Train:", nrow(hv_train), "| Test:", nrow(hv_test), "\n")
 
-cat("Card 6 - Train:", nrow(card6_train), "| Test:", nrow(card6_test), "\n")
-
-card6_recipe <- recipes::recipe(
+hv_recipe <- recipes::recipe(
   as.formula(paste("return_next ~", paste(selected_predictors, collapse = " + "))),
-  data = card6_train
+  data = hv_train
 ) %>%
   recipes::step_impute_median(all_numeric_predictors()) %>%
   recipes::step_normalize(all_numeric_predictors()) %>%
   recipes::step_zv(all_predictors()) %>%
   recipes::prep()
 
-card6_test_baked <- recipes::bake(card6_recipe, card6_test)
+hv_test_baked <- recipes::bake(hv_recipe, hv_test)
 ```
 
 ## Performance Comparison
 
-```{r card6-performance}
-#| label: card6-performance
+```{r high_volume_performance}
+hv_pred <- predict(model_lm, hv_test_baked) %>%
+  bind_cols(truth = hv_test_baked$return_next)
 
-card6_pred <- predict(model_lm, card6_test_baked) %>%
-  bind_cols(truth = card6_test_baked$return_next)
-
-card6_metrics <- card6_pred %>%
+hv_metrics <- hv_pred %>%
   yardstick::metrics(truth = truth, estimate = .pred)
 
-card6_metrics %>%
+hv_metrics %>%
   gt() %>%
   fmt_number(columns = .estimate, decimals = 4) %>%
-  tab_header(title = "Card 6: Out-of-Sample Performance")
+  tab_header(title = "High Value: Out-of-Sample Performance")
 
-card6_rsq <- card6_metrics %>% filter(.metric == "rsq") %>% pull(.estimate)
+hv_rsq <- hv_metrics %>% filter(.metric == "rsq") %>% pull(.estimate)
 basket_rsq <- lm_metrics %>% filter(.metric == "rsq") %>% pull(.estimate)
 
 cat("\n=== COMPARISON ===\n")
-cat("Card 6 R²:  ", round(card6_rsq * 100, 2), "%\n")
+cat("Card 6 R²:  ", round(hv_rsq * 100, 2), "%\n")
 cat("Basket R²:  ", round(basket_rsq * 100, 2), "%\n")
 ```
 # Trading Simulation
 
-```{r card6-trading}
-#| label: card6-trading
-
-card6_trades <- card6_pred %>%
-  bind_cols(card_6_features %>% slice_tail(n = nrow(card6_test)) %>% select(Date, Price)) %>%
+```{r high_volume_simulation}
+hv_trades <- hv_pred %>%
+  bind_cols(hv_features %>% slice_tail(n = nrow(hv_test)) %>% select(Date, Price)) %>%
   mutate(
     signal = case_when(
       .pred > 0.01 ~ "BUY",
@@ -881,7 +871,7 @@ card6_trades <- card6_pred %>%
     cum_bnh = cumprod(1 + replace_na(bnh_return, 0))
   )
 
-strategy_performance <- card6_trades %>%
+strategy_performance_hv <- hv_trades %>%
   summarise(
     n_trades = sum(signal != "HOLD"),
     total_return_strategy = last(cum_strategy) - 1,
@@ -890,22 +880,20 @@ strategy_performance <- card6_trades %>%
   )
 
 cat("\n=== TRADING SIMULATION ===\n")
-cat("Number of trades:    ", strategy_performance$n_trades, "\n")
-cat("Strategy return:     ", round(strategy_performance$total_return_strategy * 100, 2), "%\n")
-cat("Buy-and-hold return: ", round(strategy_performance$total_return_bnh * 100, 2), "%\n")
-cat("Outperformance:      ", round(strategy_performance$outperformance * 100, 2), "pp\n")
+cat("Number of trades:    ", strategy_performance_hv$n_trades, "\n")
+cat("Strategy return:     ", round(strategy_performance_hv$total_return_strategy * 100, 2), "%\n")
+cat("Buy-and-hold return: ", round(strategy_performance_hv$total_return_bnh * 100, 2), "%\n")
+cat("Outperformance:      ", round(strategy_performance_hv$outperformance * 100, 2), "pp\n")
 ```
 
-```{r card6-plot}
-#| label: card6-plot
-
-ggplot(card6_trades, aes(x = Date)) +
+```{r high_volume_plot}
+ggplot(hv_trades, aes(x = Date)) +
   geom_line(aes(y = cum_strategy, color = "ML Strategy"), linewidth = 1.2) +
   geom_line(aes(y = cum_bnh, color = "Buy & Hold"), linewidth = 1, alpha = 0.7) +
   geom_hline(yintercept = 1, linetype = "dashed", alpha = 0.5) +
   scale_color_manual(values = c("ML Strategy" = "#e74c3c", "Buy & Hold" = "#95a5a6")) +
   labs(
-    title = paste("Card 6:", unique(card_6_data$card_name)[1]),
+    title = paste("Card 6:", unique(hv_data$card_name)[1]),
     subtitle = "ML Strategy vs Buy-and-Hold",
     x = "Date", y = "Cumulative Return"
   ) +
@@ -1081,7 +1069,7 @@ ggplot(card7_trades, aes(x = Date)) +
   geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
   scale_color_manual(values = c("ML Strategy" = "#e74c3c", "Buy & Hold" = "#95a5a6")) +
   labs(
-    title = paste("Card 7:", unique(card_6_data$card_name)[1]),
+    title = paste("Card 7:", unique(card_7_data$card_name)[1]),
     subtitle = "ML Strategy vs Buy-and-Hold",
     x = "Date", y = "Cumulative Return"
   ) +
